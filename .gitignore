@@ -17,6 +17,9 @@ groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
+!groups/discord_second-brain/
+groups/discord_second-brain/*
+!groups/discord_second-brain/CLAUDE.md
 
 # Secrets
 *.keys.json

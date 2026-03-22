@@ -199,6 +199,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount env file so helpers (supabase, notion) can read credentials
+  const envFile = path.join(DATA_DIR, 'env', 'env');
+  if (fs.existsSync(envFile)) {
+    mounts.push({
+      hostPath: envFile,
+      containerPath: '/workspace/env',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(

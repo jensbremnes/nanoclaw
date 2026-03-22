@@ -1,0 +1,991 @@
+# Second Brain on NanoClaw — Full Build Spec
+# Claude Code Implementation Prompt
+
+---
+
+## 1. Context: What You Are Building
+
+A personal second-brain system built as a NanoClaw fork. The user captures
+thoughts, tasks, ideas, and reflections via:
+- Discord (text messages sent directly to the bot)
+- iPhone voice memos (recorded in the iOS Voice Memos app, auto-synced via
+  Dropbox, watched by a file watcher on the host machine)
+- Notion (items written directly into a designated Notion inbox database)
+
+The agent — named **Kjell Inge** — parses, organises, stores, and surfaces
+these intelligently. It messages the user back via Discord — but only when
+it genuinely has something worth saying, decided by a daily reasoning step.
+
+Captured items are mirrored to Notion in near real-time, so Notion serves
+as both a capture surface and a visual review/organisation layer. All three
+capture sources converge into Supabase as the single source of truth.
+
+This is built entirely within NanoClaw's existing architecture. No new
+orchestration layer. No n8n. No external workflow engine. Everything is
+implemented as:
+- NanoClaw skills (`.claude/skills/`) — for setup and installation
+- CLAUDE.md memory files (per-group and global) — for agent context and rules
+- Scheduled tasks (NanoClaw's built-in scheduler) — for sync jobs and the daily classifier
+- A lightweight file watcher script — for Dropbox voice memo ingestion
+- Supabase — for structured item storage with full-text search
+- Notion API — for two-way sync (capture from Notion, mirror items to Notion)
+
+Read the NanoClaw SPEC.md and codebase before starting. Understand the
+channel system, skills pattern, CLAUDE.md memory model, scheduled tasks,
+and container runner. Everything you build must fit inside these patterns.
+
+---
+
+## 2. Repository Setup
+
+Fork and clone NanoClaw first:
+```
+gh repo fork qwibitai/nanoclaw --clone
+cd nanoclaw
+claude
+```
+
+Then run `/setup`, `/add-discord`, and `/use-local-whisper` before
+implementing anything below.
+
+---
+
+## 3. Deliverables
+
+```
+nanoclaw/                               ← your fork of NanoClaw
+│
+├── .claude/skills/
+│   ├── setup-second-brain/
+│   │   └── SKILL.md                   ← /setup-second-brain
+│   ├── add-voice-watcher/
+│   │   └── SKILL.md                   ← /add-voice-watcher
+│   ├── add-supabase/
+│   │   └── SKILL.md                   ← /add-supabase
+│   └── add-notion-sync/
+│       └── SKILL.md                   ← /add-notion-sync
+│
+├── groups/
+│   ├── CLAUDE.md                      ← global identity: Kjell Inge
+│   └── <registered_folder>/
+│       └── CLAUDE.md                  ← second-brain group memory
+│                                         (folder name read from registered_groups)
+│
+├── scripts/
+│   ├── voice-watcher.ts               ← Dropbox voice memo file watcher
+│   └── notion-sync.ts                 ← two-way Notion sync daemon
+│
+├── supabase/
+│   └── schema.sql                     ← full Supabase schema, run once
+│
+├── groups/global/
+│   ├── supabase-helpers.sh            ← Supabase curl helpers (fully specced below)
+│   └── notion-helpers.sh              ← Notion API curl helpers
+│
+└── README-second-brain.md             ← setup guide specific to this fork
+```
+
+**Note on folder name:** The Discord group folder is not hardcoded. Read the
+registered folder name from the `registered_groups` table at implementation time
+and use it consistently throughout. Every reference to `<registered_folder>` in
+this spec means that actual folder name.
+
+---
+
+## 4. How NanoClaw Works (read this before implementing)
+
+NanoClaw's architecture:
+```
+Channel (Discord / Voice / Notion) → SQLite →
+Claude Agent (CLAUDE.md context) → Supabase + Notion sync
+```
+
+NanoClaw's agent has bash access inside the container. All Supabase calls,
+Notion API calls, and file operations happen via bash scripts sourced from
+the group's mounted directory. The CLAUDE.md files are the intelligence layer.
+
+**Do not modify NanoClaw's core source files** (`src/index.ts`, `src/db.ts`,
+etc.) unless strictly necessary. Customisation happens via CLAUDE.md and skills.
+If a core change is truly required, document exactly why.
+
+**The scheduled tasks use NanoClaw's built-in scheduler**, created by the
+agent via IPC MCP tools. Do not build a separate cron system.
+
+**Voice watcher and Notion inbound SQLite insertion must match NanoClaw's exact
+schema.** Read `src/db.ts` carefully. The message loop polls for unprocessed
+messages by specific field values — if the insertion doesn't match the expected
+format, messages will be silently ignored.
+
+---
+
+## 5. CLAUDE.md Specification
+
+### 5.1 groups/CLAUDE.md — Global Identity
+
+```markdown
+# Kjell Inge
+
+You are Kjell Inge, a personal second-brain assistant. You help the user
+capture, organise, and surface thoughts, tasks, ideas, and reflections.
+
+## Tone
+Brief, dry wit, slightly humorous. Never verbose. One or two sentences is
+usually the right length for a reply. You observe things honestly, including
+things the user might not want to hear. No filler. No "Great!" or "Sure!".
+
+## Language
+English only.
+
+## What you have access to
+- supabase-helpers.sh — persist and query items in Supabase
+- notion-helpers.sh — mirror items to Notion (if configured)
+- SQLite queue — inject messages from voice or Notion inbound
+
+Source these from /workspace/global/ before using any function.
+```
+
+### 5.2 groups/\<registered_folder\>/CLAUDE.md — Second Brain Agent
+
+```markdown
+# Kjell Inge — Second Brain
+
+You are Kjell Inge. Source /workspace/global/supabase-helpers.sh at the start
+of every session.
+
+## Identity & Tone
+Brief, dry wit, slightly humorous, never verbose. Honest observations.
+No filler phrases ("Great!", "Sure!", "Of course!"). When in doubt, say less.
+
+## Multi-Item Parsing
+
+A single message may contain multiple distinct items. Split them. Indicators:
+- Numbered or bulleted list
+- Items separated by a line break or "and also" / "plus" / "also"
+- Distinct topics in one message
+
+Each split item is processed and stored independently. Do not merge them.
+
+## Classification Taxonomy
+
+Classify each item into exactly one type:
+- **task** — something to do, an action, a commitment ("buy milk", "call dentist")
+- **idea** — a concept, insight, or possibility worth exploring
+- **reflection** — a feeling, observation about self, or retrospective thought
+- **note** — reference material, a fact, a quote, something to remember
+
+When ambiguous: prefer task if actionable, idea if speculative, reflection if
+personal/emotional, note otherwise.
+
+## Supabase Persistence Flow
+
+For each item captured (from Discord, voice, or Notion inbound):
+1. Source /workspace/global/supabase-helpers.sh
+2. Classify type
+3. Call: sb_insert_item "<content>" "<type>" "<source>" "<captured_at>"
+4. Store the returned UUID — you will need it for reply handling
+
+If sb_insert_item returns empty, log the error and reply:
+"Saved locally, Supabase sync failed — will retry"
+
+## Capture Confirmation Format
+
+After saving all items, reply with a brief summary. One line per item.
+No preamble. No trailing explanation.
+
+Format:
+```
+✅ task — <content truncated to ~6 words>
+💡 idea — <content truncated to ~6 words>
+🤔 reflection — <content truncated to ~6 words>
+📝 note — <content truncated to ~6 words>
+```
+
+Emoji mapping:
+- task → ✅
+- idea → 💡
+- reflection → 🤔
+- note → 📝
+
+Example for "buy milk, and I had a great idea about the app design,
+feeling overwhelmed today":
+```
+✅ task — buy milk
+💡 idea — app design approach
+🤔 reflection — feeling overwhelmed today
+```
+
+## Reply and Command Handling
+
+Bot messages that reference a Supabase item embed the ID invisibly:
+`<!-- id:3f2a1c... -->`
+
+This comment is stripped when displayed in Discord but is readable when
+the user replies to a bot message. Always check replied-to message content
+for this pattern.
+
+### done
+User replies "done" to a bot message.
+1. Extract ID from `<!-- id:<uuid> -->` in the quoted message
+2. Call `sb_update_status <id> done`
+3. Reply: "Done. ✓"
+4. If Notion sync is configured, the status change propagates on next sync tick
+
+### expand
+User replies "expand" to a bot message.
+1. Extract ID and full content of the referenced item (`sb_get_item <id>`)
+2. Generate a developed version (3–5 sentences, or a short paragraph)
+3. Send the expansion to Discord
+4. Do NOT overwrite the original item — the expansion is ephemeral
+
+### search \<query\> or "what have I captured about X"
+1. Call `sb_search_items "<query>" 5`
+2. Format results as a numbered list with type emoji and truncated content
+3. Append `<!-- id:<uuid> -->` to each result line so "done"/"expand" work on replies
+
+### list tasks
+1. Call `sb_get_open_tasks`
+2. Format as a checklist: `- [ ] <content>  <!-- id:<uuid> -->`
+3. If empty: "No open tasks. Suspiciously productive."
+
+### archive \<description\>
+1. Call `sb_search_items "<description>" 1`
+2. Confirm the match with user before archiving
+3. On confirmation: call `sb_archive_item <id>`
+4. Reply: "Archived."
+
+### tag \<description\> \<tag\>
+1. Call `sb_search_items "<description>" 1`
+2. On match: call `sb_add_tag <id> "<tag>"`
+3. Reply: "Tagged."
+
+## Notion Inbound
+
+When a message arrives with `sender = 'notion-inbound'`, treat it as a new
+capture from the Notion inbox. Classify, persist to Supabase, confirm.
+Do not send a Discord confirmation for Notion-inbound items.
+```
+
+---
+
+## 6. Voice Watcher Specification
+
+### File: `scripts/voice-watcher.ts`
+
+The voice watcher polls the Dropbox voice memos folder for new recordings,
+transcribes them with whisper.cpp, and injects the transcript into NanoClaw's
+SQLite queue as if the user sent a Discord message.
+
+### Dropbox Path
+
+```
+${VOICE_MEMOS_PATH:-$HOME/Dropbox/Voice Memos}
+```
+
+File formats to watch: `.m4a`
+
+### State Tracking
+
+Maintain a state file at `groups/<registered_folder>/voice-watcher-state.json`:
+```json
+{ "processed": ["filename1.m4a", "filename2.m4a"] }
+```
+
+On each poll tick:
+1. List all `.m4a` files in the Dropbox path
+2. Skip files already in `processed`
+3. For each new file: transcribe, inject if non-empty, add to `processed`
+
+### whisper.cpp Invocation
+
+```bash
+WHISPER_MODEL="${WHISPER_MODEL:-$HOME/.local/share/whisper/models/ggml-base.en.bin}"
+
+transcribe() {
+  local file="$1"
+
+  # Discard clips under 1 second
+  local duration
+  duration=$(ffprobe -v error -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+  if (( $(echo "$duration < 1" | bc -l) )); then
+    echo ""
+    return
+  fi
+
+  whisper-cpp -m "$WHISPER_MODEL" -f "$file" -ot txt \
+    --no-timestamps -of /tmp/wb_out -l en --print-progress 0 2>/dev/null
+
+  local text
+  text=$(cat /tmp/wb_out.txt 2>/dev/null \
+    | tr -d '\n' \
+    | sed 's/\[BLANK_AUDIO\]//g' \
+    | xargs)
+  echo "$text"
+}
+```
+
+Discard (do not inject) if the output is empty after trimming.
+
+### SQLite Injection Format
+
+Read `src/db.ts` and verify these field names match the current schema before
+implementing. The message loop picks up messages where:
+- `is_from_me = 0`
+- `is_bot_message = 0`
+- `timestamp > last_agent_timestamp` (per-group key in `router_state`)
+
+The `jid` for the chat must exactly match the value in `registered_groups.jid`.
+Read it from SQLite at watcher startup — never hardcode it.
+
+```typescript
+// At startup: read registered jid
+const group = db.prepare(
+  "SELECT jid FROM registered_groups WHERE folder = ?"
+).get(registeredFolder) as { jid: string };
+const chatJid = group.jid;
+
+// Ensure chat row exists
+db.prepare(`
+  INSERT OR IGNORE INTO chats (jid, name, last_message_time, channel, is_group)
+  VALUES (?, 'Second Brain', datetime('now'), 'discord', 0)
+`).run(chatJid);
+
+// Inject message
+db.prepare(`
+  INSERT INTO messages
+    (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+  VALUES (
+    lower(hex(randomblob(16))),
+    ?,
+    'voice-watcher',
+    'Voice Memo',
+    ?,
+    datetime('now'),
+    0,
+    0
+  )
+`).run(chatJid, transcript);
+```
+
+The same injection pattern applies to Notion inbound, with
+`sender = 'notion-inbound'` and `sender_name = 'Notion'`.
+
+### Cron Registration
+
+Register via NanoClaw's IPC scheduler at startup:
+- **Interval:** 30 seconds
+- **Context mode:** isolated
+- **Command:** `npx tsx scripts/voice-watcher.ts`
+
+---
+
+## 7. Supabase Schema
+
+```sql
+-- Enable full-text search (no pgvector needed)
+-- Items table
+CREATE TABLE items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  content text NOT NULL,
+  type text CHECK (type IN ('task', 'idea', 'reflection', 'note')),
+  status text DEFAULT 'open' CHECK (status IN ('open', 'done', 'archived')),
+  tags text[] DEFAULT '{}',
+  source text CHECK (source IN ('discord', 'voice', 'notion')),
+  notion_id text,
+  captured_at timestamptz,          -- original capture time (distinct from created_at)
+  last_synced_at timestamptz,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+-- User meta table (weekly reflection target)
+CREATE TABLE user_meta (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  observation text,
+  week_start date,
+  created_at timestamptz DEFAULT now()
+);
+
+-- Full-text search index (replaces vector search)
+CREATE INDEX ON items USING gin(to_tsvector('english', content));
+
+-- Sync and lookup indexes
+CREATE INDEX ON items (notion_id);
+CREATE INDEX ON items (last_synced_at);
+CREATE INDEX ON items (updated_at);
+CREATE INDEX ON items (status);
+CREATE INDEX ON items (captured_at);
+
+-- Auto-update updated_at
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER items_updated_at
+BEFORE UPDATE ON items
+FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+```
+
+---
+
+## 8. supabase-helpers.sh
+
+Create `groups/global/supabase-helpers.sh`. All functions use `curl -sS`
+against `$SUPABASE_URL/rest/v1/` with `apikey: $SUPABASE_SERVICE_KEY`.
+All functions log errors to `logs/supabase-errors.log` and return empty
+string on failure. Source `.env` at the top of the file.
+
+```bash
+#!/usr/bin/env bash
+# supabase-helpers.sh — Supabase REST helpers for Kjell Inge
+set -euo pipefail
+
+# Source env if not already loaded
+[ -f "$(dirname "$0")/../../.env" ] && source "$(dirname "$0")/../../.env"
+
+SB_URL="${SUPABASE_URL}/rest/v1"
+SB_KEY="${SUPABASE_SERVICE_KEY}"
+SB_LOG="$(dirname "$0")/../../logs/supabase-errors.log"
+
+_sb_err() { echo "[supabase-error] $(date -u +%FT%TZ) $*" >> "$SB_LOG"; }
+
+# sb_insert_item <content> <type> <source> [captured_at]
+# Returns: UUID of inserted item, or empty string on failure
+sb_insert_item() {
+  local content="$1" type="$2" source="$3"
+  local captured_at="${4:-$(date -u +%FT%TZ)}"
+  local body
+  body=$(jq -n \
+    --arg c "$content" --arg t "$type" \
+    --arg s "$source" --arg ca "$captured_at" \
+    '{content:$c, type:$t, source:$s, captured_at:$ca}')
+  local result
+  result=$(curl -sS -X POST "$SB_URL/items" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    -H "Content-Type: application/json" \
+    -H "Prefer: return=representation" \
+    -d "$body") || { _sb_err "sb_insert_item failed: $body"; echo ""; return; }
+  echo "$result" | jq -r '.[0].id // empty' 2>/dev/null \
+    || { _sb_err "sb_insert_item parse error: $result"; echo ""; }
+}
+
+# sb_update_status <id> <status>
+# Returns: "success" or "error"
+sb_update_status() {
+  local id="$1" status="$2"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" -X PATCH \
+    "$SB_URL/items?id=eq.$id" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"status\":\"$status\"}") || { _sb_err "sb_update_status $id $status failed"; echo "error"; return; }
+  [[ "$code" == "2"* ]] && echo "success" || { _sb_err "sb_update_status HTTP $code"; echo "error"; }
+}
+
+# sb_archive_item <id>
+# Returns: "success" or "error"
+sb_archive_item() {
+  sb_update_status "$1" "archived"
+}
+
+# sb_add_tag <id> <tag>
+# Returns: "success" or "error"
+sb_add_tag() {
+  local id="$1" tag="$2"
+  # Append tag using Supabase's array append via RPC or manual read-modify-write
+  local current_tags
+  current_tags=$(curl -sS "$SB_URL/items?id=eq.$id&select=tags" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY") || { _sb_err "sb_add_tag fetch $id failed"; echo "error"; return; }
+  local new_tags
+  new_tags=$(echo "$current_tags" | jq -r ".[0].tags + [\"$tag\"] | @json" 2>/dev/null)
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" -X PATCH \
+    "$SB_URL/items?id=eq.$id" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"tags\":$new_tags}") || { _sb_err "sb_add_tag patch $id failed"; echo "error"; return; }
+  [[ "$code" == "2"* ]] && echo "success" || echo "error"
+}
+
+# sb_set_notion_id <id> <notion_id>
+# Returns: "success" or "error"
+sb_set_notion_id() {
+  local id="$1" notion_id="$2"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" -X PATCH \
+    "$SB_URL/items?id=eq.$id" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"notion_id\":\"$notion_id\",\"last_synced_at\":\"$(date -u +%FT%TZ)\"}") \
+    || { _sb_err "sb_set_notion_id $id failed"; echo "error"; return; }
+  [[ "$code" == "2"* ]] && echo "success" || echo "error"
+}
+
+# sb_get_item <id>
+# Returns: JSON object or empty string
+sb_get_item() {
+  local id="$1"
+  curl -sS "$SB_URL/items?id=eq.$id" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '.[0] // empty' 2>/dev/null \
+    || { _sb_err "sb_get_item $id failed"; echo ""; }
+}
+
+# sb_search_items <query> [limit=5]
+# Returns: JSON array
+sb_search_items() {
+  local query="$1" limit="${2:-5}"
+  local encoded
+  encoded=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+    "to_tsvector('english', content) @@ plainto_tsquery('english', '$query')" 2>/dev/null \
+    || echo "")
+  # Use ILIKE as fallback for simplicity and reliability
+  curl -sS "$SB_URL/items?content=ilike.*$(python3 -c \
+    "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
+    "$query" 2>/dev/null)&limit=$limit&status=neq.archived" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '. // []' 2>/dev/null \
+    || { _sb_err "sb_search_items \"$query\" failed"; echo "[]"; }
+}
+
+# sb_get_open_tasks [older_than_days]
+# Returns: JSON array of open tasks
+sb_get_open_tasks() {
+  local days="${1:-0}"
+  local filter="status=eq.open&type=eq.task&order=captured_at.asc"
+  if [[ "$days" -gt 0 ]]; then
+    local cutoff
+    cutoff=$(date -u -v-"${days}d" +%FT%TZ 2>/dev/null \
+      || date -u -d "$days days ago" +%FT%TZ)
+    filter="$filter&captured_at=lt.$cutoff"
+  fi
+  curl -sS "$SB_URL/items?$filter" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '. // []' 2>/dev/null \
+    || { _sb_err "sb_get_open_tasks failed"; echo "[]"; }
+}
+
+# sb_get_items_by_type <type> [limit]
+# Returns: JSON array
+sb_get_items_by_type() {
+  local type="$1" limit="${2:-20}"
+  curl -sS "$SB_URL/items?type=eq.$type&status=neq.archived&limit=$limit&order=captured_at.desc" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '. // []' 2>/dev/null \
+    || { _sb_err "sb_get_items_by_type $type failed"; echo "[]"; }
+}
+
+# sb_get_recent [days=7]
+# Returns: JSON array of items from the last N days
+sb_get_recent() {
+  local days="${1:-7}"
+  local cutoff
+  cutoff=$(date -u -v-"${days}d" +%FT%TZ 2>/dev/null \
+    || date -u -d "$days days ago" +%FT%TZ)
+  curl -sS "$SB_URL/items?captured_at=gt.$cutoff&status=neq.archived&order=captured_at.desc" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '. // []' 2>/dev/null \
+    || { _sb_err "sb_get_recent $days failed"; echo "[]"; }
+}
+
+# sb_get_unsynced [limit=20]
+# Returns: JSON array of items not yet synced to Notion
+sb_get_unsynced() {
+  local limit="${1:-20}"
+  curl -sS "$SB_URL/items?notion_id=is.null&limit=$limit&order=created_at.asc" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    | jq '. // []' 2>/dev/null \
+    || { _sb_err "sb_get_unsynced failed"; echo "[]"; }
+}
+
+# sb_write_user_meta <observation> <week_start>
+# Returns: "success" or "error"
+sb_write_user_meta() {
+  local observation="$1" week_start="$2"
+  local body
+  body=$(jq -n \
+    --arg o "$observation" --arg w "$week_start" \
+    '{observation:$o, week_start:$w}')
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+    "$SB_URL/user_meta" \
+    -H "apikey: $SB_KEY" \
+    -H "Authorization: Bearer $SB_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body") || { _sb_err "sb_write_user_meta failed"; echo "error"; return; }
+  [[ "$code" == "2"* ]] && echo "success" || echo "error"
+}
+```
+
+---
+
+## 9. Notion Two-Way Sync
+
+### Architecture
+
+Supabase is the single source of truth. Notion is a sync target and a
+capture surface. The sync script (`scripts/notion-sync.ts`) runs on a
+NanoClaw scheduled task every 2 minutes and handles both directions.
+
+```
+Discord / Voice → SQLite → Agent → Supabase ←→ notion-sync.ts ←→ Notion DB
+                                                        ↑
+                                              Notion inbox capture
+```
+
+The script is invoked via: `npx tsx scripts/notion-sync.ts`
+
+### Notion Database Schema
+
+Create one Notion database called **Second Brain**. It must have exactly
+these properties:
+
+| Property       | Notion Type    | Notes                                      |
+|----------------|----------------|--------------------------------------------|
+| Name           | Title          | Item content (truncated to 100 chars)      |
+| Full Content   | Text           | Full text of the item                      |
+| Type           | Select         | task / idea / reflection / note            |
+| Status         | Select         | open / done / archived                     |
+| Tags           | Multi-select   | Free tags from agent classification        |
+| Source         | Select         | discord / voice / notion                   |
+| Supabase ID    | Text           | UUID from Supabase — the sync key          |
+| Notion ID      | Text           | Notion page ID — written back to Supabase  |
+| Captured At    | Date           | Original capture timestamp                 |
+| Synced At      | Date           | Last sync timestamp, updated each pass     |
+
+### Outbound Sync (Supabase → Notion)
+
+On each scheduler tick:
+1. Query Supabase for items where `notion_id IS NULL` (never synced) or
+   `updated_at > last_synced_at` (updated since last sync).
+2. For each item, upsert a Notion page using the database schema above.
+3. Write the returned Notion page ID back to `supabase.items.notion_id`.
+4. Update `supabase.items.last_synced_at` to now.
+
+Cap at 20 items per tick to stay within Notion's rate limit (~3 req/s).
+Add a 400ms delay between API calls.
+
+### Inbound Sync (Notion → Supabase)
+
+On each scheduler tick, after outbound:
+1. Query the Notion database for pages where `Supabase ID` is empty
+   AND `created_time > $NOTION_SETUP_AFTER` (see stale page filter below).
+2. For each such page, insert a new row into `supabase.items` with
+   `source = 'notion'`.
+3. Write the new Supabase UUID back to the page's `Supabase ID` property.
+4. Inject a message into NanoClaw's SQLite queue so the agent processes
+   the new item (classification, tagging). Use the exact SQLite injection
+   format from Section 6, with `sender = 'notion-inbound'` and
+   `sender_name = 'Notion'`.
+
+### Stale Page Filter
+
+Pages that existed in Notion before the system was set up must be excluded
+from inbound sync (they are not new captures — they pre-date the system).
+
+At setup time, `/add-notion-sync` writes the current timestamp to `.env`:
+```
+NOTION_SETUP_AFTER=2024-01-15T10:30:00.000Z
+```
+
+The inbound sync query filters: `filter: { created_time: { after: process.env.NOTION_SETUP_AFTER } }`
+
+### Conflict Resolution
+
+- Supabase always wins on content conflicts. If the same item is edited in
+  both places between sync ticks, the Supabase version overwrites Notion.
+- Status changes made in Notion (e.g. marking a task done) ARE respected:
+  sync the `Status` property back to `supabase.items.status` on inbound pass.
+- Never create duplicate items. The `Supabase ID` property in Notion is the
+  deduplication key. Always check before inserting.
+
+### Loop Prevention
+
+Tag every Supabase row inserted from Notion with `source = 'notion'`.
+The outbound sync skips rows that were inserted in the current tick's
+inbound pass (use a per-tick set of newly inserted IDs).
+
+---
+
+## 10. notion-helpers.sh
+
+Create `groups/global/notion-helpers.sh` with these functions:
+
+```bash
+# notion_upsert_page <supabase_id> <content> <type> <status> <tags> <source> <captured_at>
+# Creates or updates a Notion page. Returns the Notion page ID.
+# - If a page with the matching Supabase ID already exists, update it.
+# - If not, create a new page.
+# Uses: NOTION_API_KEY, NOTION_DATABASE_ID from .env
+
+# notion_get_new_pages
+# Returns all pages in the database where Supabase ID property is empty
+# AND created_time > NOTION_SETUP_AFTER.
+# Output: JSON array of {notion_id, content, type, status, captured_at}
+
+# notion_set_supabase_id <notion_page_id> <supabase_uuid>
+# Writes the Supabase UUID back to the Notion page's Supabase ID property.
+
+# notion_update_status <notion_page_id> <status>
+# Updates the Status property of a Notion page.
+
+# notion_sync_status_back <notion_page_id>
+# Reads current Status from Notion and returns it as a plain string.
+# Used by inbound sync to detect user-made status changes.
+```
+
+All functions use curl against `https://api.notion.com/v1/`.
+All functions respect the 400ms inter-call delay.
+All functions log errors to `groups/<registered_folder>/logs/notion-errors.log`.
+(Use the actual registered folder name, not the literal string.)
+
+---
+
+## 11. Daily Smart Nudge Job
+
+### Registration
+
+Register via NanoClaw's IPC scheduler:
+- **Schedule:** 08:00 in the user's local timezone
+- **Context mode:** isolated
+- **Command:** agent invocation with the prompt below
+
+### Behaviour
+
+The job reasons over the inbox and sends **at most one** message to Discord.
+It stays silent if nothing is genuinely worth surfacing. Never send a message
+just to report the inbox is clean.
+
+### Prompt Template
+
+```
+You are Kjell Inge, a personal second brain assistant.
+Source: /workspace/global/supabase-helpers.sh
+
+Check the inbox now:
+1. Open tasks captured 3+ days ago: sb_get_open_tasks 3
+2. Ideas that look lonely — no follow-up captures in the same area (use
+   sb_get_items_by_type idea and check for clusters vs isolated items)
+3. Items open for 7+ days: sb_get_recent 30, then filter status=open and
+   age > 7 days based on captured_at
+4. Patterns: if the same theme appears 3+ times in the last 7 days
+   (sb_get_recent 7), note it
+
+If you find at least one thing genuinely worth surfacing: compose a short,
+specific, slightly wry message (1–3 sentences) and send it to the user via
+IPC to their Discord. One nudge, not a list.
+
+If nothing is worth saying, do nothing. Log "nudge: nothing to surface" to
+stdout and exit.
+```
+
+---
+
+## 12. Weekly Reflection Job
+
+### Registration
+
+Register via NanoClaw's IPC scheduler:
+- **Schedule:** Sunday 20:00 in the user's local timezone
+- **Context mode:** isolated
+- **Command:** agent invocation with the prompt below
+
+### Prompt Template
+
+```
+You are Kjell Inge. It is Sunday evening.
+Source: /workspace/global/supabase-helpers.sh
+
+Read this week's captures: sb_get_recent 7
+
+Write 2–4 honest, specific observations about:
+- What the user has been thinking about this week
+- What themes or topics keep recurring
+- What they started and did not finish
+- Anything surprising in the pattern
+
+No praise. No fluff. No "Great week!" opener. Be candid.
+
+Then:
+1. Compute this week's Monday date (today minus 6 days)
+2. Call sb_write_user_meta with a concise observation string and the Monday date
+3. Send the observations to the user's Discord as a brief message (4–6 sentences max)
+```
+
+---
+
+## 13. Skill: /add-supabase
+
+Create `.claude/skills/add-supabase/SKILL.md` that automates:
+
+1. Prompt the user for:
+   - `SUPABASE_URL` — from Supabase project settings (e.g. `https://xxxx.supabase.co`)
+   - `SUPABASE_SERVICE_KEY` — service role key (not anon key)
+2. Validate both values by making a test API call: `GET $SUPABASE_URL/rest/v1/` with the service key. Confirm 200 response.
+3. Write both to `.env`.
+4. Run `supabase/schema.sql` against the project using the psql connection string from the Supabase dashboard:
+   ```
+   psql "postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres" \
+     -f supabase/schema.sql
+   ```
+   Prompt the user for the psql connection string if `psql` is available, or
+   instruct them to run the SQL manually in the Supabase SQL editor if not.
+5. Verify schema by querying the `items` table:
+   `GET $SUPABASE_URL/rest/v1/items?limit=1`
+   Confirm the response is a JSON array (even if empty).
+
+---
+
+## 14. Skill: /add-notion-sync
+
+Create `.claude/skills/add-notion-sync/SKILL.md` that automates:
+
+1. Prompt the user for:
+   - `NOTION_API_KEY` — from Notion integration settings
+   - `NOTION_DATABASE_ID` — the ID of the Second Brain database
+2. Validate both by making a test API call to retrieve the database schema.
+3. Write both to `.env`.
+4. Write the current timestamp to `.env` as `NOTION_SETUP_AFTER` (ISO 8601 UTC).
+5. Create any missing database properties via the Notion API.
+6. Register `scripts/notion-sync.ts` as a NanoClaw scheduled task running
+   every 2 minutes via the IPC MCP scheduler. Command: `npx tsx scripts/notion-sync.ts`
+7. Send a test item via Discord and verify it appears in Notion within 3 ticks (6 minutes max).
+8. Create a test item directly in Notion (after the `NOTION_SETUP_AFTER` timestamp)
+   and verify it appears in Supabase within 3 ticks.
+
+---
+
+## 15. Skill: /add-voice-watcher
+
+Create `.claude/skills/add-voice-watcher/SKILL.md` that automates:
+
+1. Confirm whisper.cpp is available: `which whisper-cpp`. If not found, abort
+   with instructions to run `/use-local-whisper` first.
+2. Prompt for the Dropbox voice memos folder path, default `~/Dropbox/Voice Memos`.
+   Write as `VOICE_MEMOS_PATH` to `.env`. Confirm path exists.
+3. Read the registered Discord folder name from `registered_groups` in SQLite.
+4. Write `scripts/voice-watcher.ts` using the spec in Section 6.
+5. Register as a NanoClaw scheduled task:
+   - Interval: 30 seconds
+   - Context mode: isolated
+   - Command: `npx tsx scripts/voice-watcher.ts`
+6. Instruct the user to record a short test voice memo on their iPhone.
+7. Wait up to 60 seconds and verify the transcript appears in Supabase
+   (poll `sb_get_recent 1` every 10 seconds).
+
+---
+
+## 16. Skill: /setup-second-brain
+
+Create `.claude/skills/setup-second-brain/SKILL.md` that orchestrates the
+full install in order:
+
+1. **Verify prerequisites:** Check that `/add-discord` was already run by
+   querying the `registered_groups` table. If empty, abort with instructions.
+   Read and store the registered folder name for use in all subsequent steps.
+2. **Run `/add-supabase`** — install Supabase credentials and schema.
+3. **Run `/use-local-whisper`** — ensure whisper.cpp is available.
+4. **Write `groups/global/supabase-helpers.sh`** — full content from Section 8.
+5. **Optionally write `groups/global/notion-helpers.sh`** — ask the user if they
+   want Notion sync. If yes, write the helpers and run `/add-notion-sync`.
+6. **Write `groups/CLAUDE.md`** — global identity content from Section 5.1.
+7. **Write `groups/<registered_folder>/CLAUDE.md`** — full agent spec from Section 5.2,
+   substituting the actual registered folder name where shown.
+8. **Register daily nudge job** — Section 11 cron (08:00, isolated).
+9. **Register weekly reflection job** — Section 12 cron (Sunday 20:00, isolated).
+10. **Send test capture via Discord:** "test task: setup-second-brain verification"
+    Wait up to 10 seconds and verify the item appears in Supabase (`sb_get_recent 1`).
+11. **Print success checklist:**
+    ```
+    ✓ Supabase schema created
+    ✓ supabase-helpers.sh written
+    ✓ CLAUDE.md files written (global + group)
+    ✓ Daily nudge registered (08:00)
+    ✓ Weekly reflection registered (Sunday 20:00)
+    ✓ Test capture verified in Supabase
+    [ ] Notion sync (skipped / verified)
+    [ ] Voice watcher (run /add-voice-watcher separately)
+    ```
+
+---
+
+## 17. Error Handling
+
+| Scenario | Behaviour |
+|---|---|
+| Whisper transcription fails | Insert `[transcription failed]` as content, preserve the file, log error |
+| Voice memo too short (< 1 second) | Discard silently |
+| Whisper output is empty or `[BLANK_AUDIO]` | Discard silently — do not create a blank item |
+| Supabase insert fails | Log to `logs/supabase-errors.log`, reply to user: "Saved locally, Supabase sync failed — will retry" |
+| Notion API call fails | Log to `logs/notion-errors.log`, skip item for this tick, retry next tick. Alert user only after 10 consecutive failed ticks. |
+| Classifier produces malformed response | Default to type `note`, log warning |
+| Notion inbound: page pre-dates setup | Skip (filtered by `created_time > NOTION_SETUP_AFTER`) |
+| Notion → Supabase injection fails | Log error, leave `Supabase ID` empty in Notion — next tick retries it |
+| Daily nudge finds nothing | Log "nudge: nothing to surface", exit silently |
+| Supabase search returns empty | Reply: "Nothing found for that." |
+
+---
+
+## 18. Build Order
+
+Follow this order. Each step is independently testable before proceeding.
+
+1. **`supabase/schema.sql`** — verify in Supabase SQL editor before anything else. Confirm `items` and `user_meta` tables exist.
+2. **`groups/global/supabase-helpers.sh`** — test each function manually with `bash -c 'source groups/global/supabase-helpers.sh && sb_insert_item "test" "note" "discord"'`
+3. **`groups/global/notion-helpers.sh`** — test each function manually with a real Notion database.
+4. **`groups/CLAUDE.md` and `groups/<registered_folder>/CLAUDE.md`** — send a test multi-item message and verify the agent splits and saves correctly to Supabase.
+5. **`scripts/notion-sync.ts`** — test outbound sync first, then inbound (create a page in Notion after `NOTION_SETUP_AFTER`), then conflict resolution and loop prevention.
+6. **`scripts/voice-watcher.ts`** — record a test voice memo, verify transcript and injection within 60 seconds.
+7. **`.claude/skills/add-supabase/SKILL.md`** — run on a clean `.env` to verify end-to-end.
+8. **`.claude/skills/add-notion-sync/SKILL.md`** — run and verify both sync directions.
+9. **`.claude/skills/add-voice-watcher/SKILL.md`** — run and verify detection-to-Supabase flow.
+10. **`.claude/skills/setup-second-brain/SKILL.md`** — orchestrates steps 1–4 and 6–9. Run last.
+11. **`README-second-brain.md`** — write last, based on what actually worked.
+
+**Prerequisites before step 1:** `/setup` + `/add-discord` + `/use-local-whisper` must all be complete.
+
+---
+
+## 19. Success Criteria
+
+The system is complete when:
+
+- A text message sent to the Discord bot containing multiple items produces
+  correctly split and classified items in Supabase within 5 seconds
+- Each captured item receives a confirmation reply in the correct emoji format
+- Those items appear in Notion within 2 minutes (one sync tick)
+- An iPhone voice memo recorded and synced via Dropbox produces items in
+  Supabase within 30 seconds, and in Notion within 2 minutes
+- An item typed directly into the Notion inbox database (after `NOTION_SETUP_AFTER`)
+  appears in Supabase within 2 minutes and is processed by the agent
+- Status changes made in Notion (e.g. marking done) propagate back to Supabase
+  within 2 minutes
+- The daily nudge job runs at 08:00, either sends a message or logs a skip —
+  never sends a message just to confirm the inbox is clean
+- The weekly reflection job runs Sunday 20:00, writes to `user_meta`, and
+  sends a candid summary to Discord
+- Replying "done" to a bot message marks the correct item done in Supabase
+  (and Notion within one sync tick)
+- Replying "expand" produces a developed version in Discord without modifying
+  the original item
+- `search <query>` returns top 5 results using full-text ILIKE search
+- "list tasks" returns all open tasks with embedded IDs
+- The weekly reflection writes a row to `user_meta`
+- No silent failures — all errors produce a log entry or a user-facing message
+- No duplicate items created by the sync loop under any timing condition
+- Voice memos shorter than 1 second or with blank transcripts are silently discarded
