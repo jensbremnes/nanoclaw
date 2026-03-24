@@ -1,5 +1,7 @@
 -- Second Brain — Supabase schema
 -- Run once in the Supabase SQL editor or via psql
+-- For the PARA upgrade (goals, projects, weekly_digests, new item columns)
+-- run supabase/migrations/001_para_upgrade.sql afterwards.
 
 -- Items table
 CREATE TABLE IF NOT EXISTS items (

@@ -1,0 +1,11 @@
+[Unit]
+Description=NanoClaw Second Brain Weekly Digest
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jens/nanoclaw
+EnvironmentFile=/home/jens/nanoclaw/data/env/env
+ExecStart=/usr/bin/env npx tsx scripts/weekly-digest.ts
+StandardOutput=append:/home/jens/nanoclaw/logs/weekly-digest.log
+StandardError=append:/home/jens/nanoclaw/logs/weekly-digest.log

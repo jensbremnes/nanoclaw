@@ -1,0 +1,11 @@
+[Unit]
+Description=NanoClaw Second Brain Elaborator
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/jens/nanoclaw
+EnvironmentFile=/home/jens/nanoclaw/data/env/env
+ExecStart=/usr/bin/env npx tsx scripts/elaborator.ts
+StandardOutput=append:/home/jens/nanoclaw/logs/elaborator.log
+StandardError=append:/home/jens/nanoclaw/logs/elaborator.log

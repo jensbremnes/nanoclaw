@@ -1,3 +1,4 @@
+import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -346,6 +347,24 @@ async function runAgent(
   }
 }
 
+async function sendBridgeUrl(
+  chatJid: string,
+  sendMsg: (jid: string, text: string) => Promise<void>,
+): Promise<void> {
+  return new Promise((resolve) => {
+    exec('journalctl -u claude-remote -n 20 --no-pager', (_err, stdout) => {
+      const match = stdout?.match(/https:\/\/claude\.ai\/code\?bridge=\S+/);
+      if (match) {
+        sendMsg(chatJid, `Claude remote session ready: ${match[0]}`)
+          .then(resolve)
+          .catch(resolve);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -597,6 +616,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // 60 seconds after boot, send the claude-remote bridge URL to all registered groups
+  setTimeout(() => {
+    for (const [jid] of Object.entries(registeredGroups)) {
+      sendBridgeUrl(jid, async (chatJid, text) => {
+        const ch = findChannel(channels, chatJid);
+        if (ch) await ch.sendMessage(chatJid, text);
+      }).catch((err) => logger.warn({ err }, 'Bridge URL send failed'));
+    }
+  }, 60_000);
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -647,6 +676,11 @@ async function main(): Promise<void> {
         writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
       }
     },
+    getBridgeUrl: (chatJid) =>
+      sendBridgeUrl(chatJid, async (jid, text) => {
+        const ch = findChannel(channels, jid);
+        if (ch) await ch.sendMessage(jid, text);
+      }),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

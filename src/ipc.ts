@@ -23,6 +23,7 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  getBridgeUrl: (chatJid: string) => Promise<void>;
 }
 
 let ipcWatcherRunning = false;
@@ -454,6 +455,21 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'get_bridge_url': {
+      if (!data.chatJid) break;
+      // Authorization: non-main groups can only request for their own chatJid
+      const targetGroup = registeredGroups[data.chatJid];
+      if (!isMain && (!targetGroup || targetGroup.folder !== sourceGroup)) {
+        logger.warn(
+          { sourceGroup, chatJid: data.chatJid },
+          'Unauthorized get_bridge_url attempt blocked',
+        );
+        break;
+      }
+      await deps.getBridgeUrl(data.chatJid);
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

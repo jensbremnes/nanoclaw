@@ -106,9 +106,64 @@ User replies "expand" to a bot message.
 2. On match: call `sb_add_tag <id> "<tag>"`
 3. Reply: "Tagged."
 
+## Project Assignment
+
+After capturing a **task** or **idea**, call `sb_list_projects` to check for active projects. If the item's content clearly maps to a project by name or description, call `sb_assign_to_project <item_id> <project_id>`. If no match, leave unassigned — the elaborator will handle it.
+
+New project commands:
+
+### create project <name>
+1. Ask for a brief description and category (projects / areas / resources) if not provided
+2. Call `sb_create_project "<name>" "<description>" "<category>"`
+3. Reply: "Project created: <name>"
+
+### list projects
+1. Call `sb_list_projects`
+2. Format as a numbered list with name and status
+
+### assign <description> to <project>
+1. Call `sb_search_items "<description>" 1` to find the item
+2. Call `sb_list_projects` to find the project
+3. Call `sb_assign_to_project <item_id> <project_id>`
+4. Reply: "Assigned."
+
+## Auto-tagging
+
+After calling `sb_insert_item`, apply 1–3 tags automatically based on content. Use:
+
+**Domain:** work, personal, health, finance, tech, creative, learning
+**Horizon:** today, this-week, this-month, long-term
+**Context:** needs-research, in-progress, blocked, quick-win
+
+Example: "Set up CI pipeline" → tags: work, tech, this-week
+
+Call `sb_add_tag "$item_id" "<tag>"` for each tag immediately after insert.
+
+## Elaboration
+
+Items are automatically elaborated by the `elaborator.ts` daemon within 5 minutes. The elaboration appears in the item's Notion page body.
+
+When the user replies "expand" to a bot message, generate an immediate inline expansion (3–5 sentences) as a preview — do NOT wait for the daemon.
+
+### related
+User replies "related" to a bot message.
+1. Extract item ID from context or search by content
+2. Call `sb_get_related <id>`
+3. Format as a numbered list of related items with type emoji
+
 ## Notion Inbound
 
 When a message arrives with `sender = 'notion-inbound'`, treat it as a new capture from the Notion inbox. Classify, persist to Supabase, confirm. Do not send a Discord confirmation for Notion-inbound items.
+
+## Bridge URL
+
+When the user asks for the Claude remote / bridge URL, write this IPC command to `/workspace/ipc/tasks/<uuid>.json`:
+
+```json
+{"type": "get_bridge_url", "chatJid": "dc:<your-channel-id>"}
+```
+
+Replace `<your-channel-id>` with the numeric Discord channel ID this message arrived on. The host process will run `journalctl -u claude-remote` and send the URL back. Do not attempt to run journalctl yourself.
 
 ## Message Formatting
 

@@ -254,10 +254,10 @@ Discord / Voice / Notion
   Kjell Inge agent (Claude, in container)
         ↓
    Supabase (source of truth)
-        ↓
-   notion-sync.ts (host-side daemon)
-        ↓
-   Notion database (visual layer)
+        ↓          ↓           ↓            ↓
+notion-sync.ts  elaborator  weekly-digest  dashboard-server.ts
+(PARA Notion    (auto-       (Sun digest    (local web UI
+ hub mirror)     elaboration) Notion page)   :8181)
 ```
 
 Voice memos and Notion inbound items inject into the SQLite queue via host-side scripts that run as systemd services (they need direct filesystem and database access that containers can't provide).
@@ -293,35 +293,73 @@ All written to `.env` by the skills. Synced to `data/env/env` for container acce
 | `SUPABASE_URL` | Yes | Project URL from Supabase settings |
 | `SUPABASE_SERVICE_KEY` | Yes | Service role key (not anon key) |
 | `NOTION_API_KEY` | Optional | Notion integration token |
-| `NOTION_DATABASE_ID` | Optional | ID of the Second Brain Notion database |
+| `NOTION_DATABASE_ID` | Optional | ID of the Second Brain Notion database (flat DB, existing) |
+| `NOTION_HUB_PAGE_ID` | Optional | ID of the master "🧠 Second Brain" PARA hub page |
 | `NOTION_SETUP_AFTER` | Auto-set | ISO timestamp; pages before this are ignored for inbound sync |
+| `ELABORATOR_MODEL` | Optional | Claude model for auto-elaboration (default: `claude-haiku-4-5-20251001`) |
 | `VOICE_MEMOS_PATH` | Optional | Path to Dropbox voice memos folder (default: `~/Dropbox/Voice Memos`) |
 | `WHISPER_MODEL` | Optional | Path to ggml model file (default: `data/models/ggml-base.bin`) |
 | `WHISPER_BIN` | Optional | whisper binary name (default: `whisper-cli`) |
+| `DASHBOARD_PORT` | Optional | Dashboard HTTP port (default: `8181`) |
 
 ## Supabase Schema
 
-Two tables in `supabase/schema.sql`:
+Tables defined in `supabase/schema.sql`. After initial setup, run `supabase/migrations/001_para_upgrade.sql` to add the PARA tables and columns.
 
 **`items`** — everything captured:
 - `type`: `task` / `idea` / `reflection` / `note`
 - `status`: `open` / `done` / `archived`
 - `source`: `discord` / `voice` / `notion`
-- `tags[]` — free tags added by agent or user
-- `notion_id` — linked Notion page
+- `tags[]` — auto-applied and user-set tags
+- `notion_id` — linked flat-database Notion page (bidirectional sync)
+- `notion_hub_page_id` — linked PARA hub Notion page (with rich body)
+- `elaboration` — AI-generated elaboration from `elaborator.ts`
+- `project_id` — optional link to a project
+- `related_item_ids[]` — semantically related items found by elaborator
 - Full-text search via `to_tsvector` GIN index
 
-**`user_meta`** — weekly reflection snapshots written by the Sunday job.
+**`projects`** — active projects and areas:
+- `para_category`: `projects` / `areas` / `resources`
+- Links to `goals` via `goal_id`
+- Syncs to the Projects database in the Notion hub
 
-Run the schema once in the Supabase SQL editor or via psql. `/add-supabase` automates this.
+**`goals`** — long-term goals linked to projects. Syncs to Goals database in Notion.
 
-## Notion Database
+**`weekly_digests`** — AI-generated weekly summaries:
+- Written by `weekly-digest.ts` every Sunday at 22:00
+- Synced to Notion as child pages under "📅 Weekly Digests"
 
-One database called **Second Brain** with these properties:
+**`user_meta`** — weekly reflection snapshots written by the Sunday agent job.
+
+## Notion Structure
+
+### PARA Hub
+
+Create a page called **🧠 Second Brain** in Notion, copy its ID into `NOTION_HUB_PAGE_ID`. On first run, `notion-sync.ts` auto-creates the full sub-structure:
+
+```
+🧠 Second Brain
+├── 🗂 Projects   ← syncs projects table
+├── 🎯 Goals      ← syncs goals table
+├── 📋 Tasks      ← task items with AI elaboration in page body
+├── 📚 Resources  ← idea + note items with AI elaboration
+├── 🪞 Reflections ← reflection items with AI elaboration
+├── 📦 Archive    ← archived items
+└── 📅 Weekly Digests ← one page per week, AI-generated narrative
+```
+
+Each item page body contains:
+- **Original Capture** — quoted verbatim
+- **Elaboration** — AI-generated (context, subtasks/expansion, next steps, related concepts)
+- **Metadata** — type, source, captured date
+
+### Flat Database (legacy, unchanged)
+
+The original **Second Brain** database (`NOTION_DATABASE_ID`) continues to work as before. Properties:
 
 | Property | Type | Notes |
 |----------|------|-------|
-| Name | Title | Content (first 100 chars) |
+| Navn | Title | Content (first 100 chars) |
 | Full Content | Text | Full text |
 | Type | Select | task / idea / reflection / note |
 | Status | Select | open / done / archived |
@@ -331,7 +369,7 @@ One database called **Second Brain** with these properties:
 | Captured At | Date | Original capture time |
 | Synced At | Date | Updated on each sync pass |
 
-Sync runs every 2 minutes via a systemd timer. Status changes made in Notion propagate back to Supabase automatically.
+Bidirectional status sync still runs every 2 minutes. Status changes in the flat database propagate back to Supabase automatically.
 
 ## Agent Commands
 
@@ -341,9 +379,13 @@ Send these in Discord (no @mention needed):
 |---------|-------------|
 | Any message | Captured, classified, stored |
 | `done` (reply to bot) | Marks item done |
-| `expand` (reply to bot) | Writes a longer version |
+| `expand` (reply to bot) | Immediate inline expansion (3–5 sentences) |
+| `related` (reply to bot) | Lists semantically related items |
 | `search <query>` | Full-text search, top 5 |
 | `list tasks` | All open tasks |
+| `list projects` | All active projects |
+| `create project <name>` | Creates a project (prompts for description/category) |
+| `assign <description> to <project>` | Links item to a project |
 | `archive <description>` | Archives matching item |
 | `tag <description> <tag>` | Tags matching item |
 
@@ -369,6 +411,7 @@ Confirmation reply format (one line per item):
 |-----|----------|-------------|
 | Daily nudge | 08:00 daily | Surfaces stale tasks, lonely ideas, patterns. Silent if nothing worth saying. |
 | Weekly reflection | Sunday 20:00 | Candid observations on the week's captures. Writes to `user_meta`. |
+| Weekly digest | Sunday 22:00 | `weekly-digest.ts` generates an AI narrative of the week → Notion page auto-created. |
 
 Both run as isolated NanoClaw agent tasks (no session history — fresh context each run). Registered directly in the `scheduled_tasks` SQLite table.
 
@@ -406,6 +449,75 @@ tail -f logs/notion-sync.log
 tail -f logs/notion-errors.log
 ```
 
+### dashboard
+
+`scripts/dashboard-server.ts` — serves a modern card-based web UI at `http://127.0.0.1:8181` (configurable via `DASHBOARD_PORT`).
+
+Filter items by type, status, tag, or search. Mark items done or archived with one click — changes write to Supabase and sync to Notion automatically within 2 minutes via `notion-sync.ts`.
+
+**Install** (one-time, after running `/setup-second-brain`):
+
+```bash
+cp scripts/dashboard.service ~/.config/systemd/user/nanoclaw-dashboard.service
+systemctl --user daemon-reload
+systemctl --user enable --now nanoclaw-dashboard.service
+```
+
+```bash
+# Check status
+systemctl --user status nanoclaw-dashboard
+
+# Logs
+tail -f logs/dashboard.log
+
+# Open
+open http://127.0.0.1:8181   # macOS
+xdg-open http://127.0.0.1:8181  # Linux
+```
+
+### elaborator
+
+`scripts/elaborator.ts` — runs every 5 minutes. Picks up items with no elaboration, calls Claude API with a type-specific prompt, finds related items via keyword and tag matching, stores results in Supabase. On the next `notion-sync.ts` run, elaboration appears in the item's Notion hub page body.
+
+```bash
+# Check status
+systemctl --user status nanoclaw-elaborator
+
+# Check timer
+systemctl --user list-timers | grep elaborator
+
+# Logs
+tail -f logs/elaborator.log
+
+# Run manually
+npx tsx scripts/elaborator.ts
+```
+
+### weekly-digest
+
+`scripts/weekly-digest.ts` — runs Sunday at 22:00. Fetches all items captured during the week, completed tasks, and the user's own reflection. Calls Claude API to generate a narrative digest. Inserts into `weekly_digests` table; `notion-sync.ts` creates the Notion page on the next run.
+
+```bash
+# Check timer
+systemctl --user list-timers | grep weekly-digest
+
+# Logs
+tail -f logs/weekly-digest.log
+
+# Run manually
+npx tsx scripts/weekly-digest.ts
+```
+
+### bridge-url
+
+NanoClaw automatically sends the `claude-remote` bridge URL to all registered Discord channels 60 seconds after startup — no manual script needed.
+
+**How it works:**
+- 60 seconds after all channels connect, `src/index.ts` runs `journalctl -u claude-remote -n 20 --no-pager` on the host
+- If a `https://claude.ai/code?bridge=...` URL is found, it is sent to all registered groups
+- If the URL is not ready yet (e.g. `claude-remote` started after NanoClaw), ask the bot: **"send me the bridge URL"**
+  - The agent writes a `get_bridge_url` IPC command and the host fetches + sends the URL on demand
+
 ## Second Brain Verification
 
 After install, confirm all of these work:
@@ -416,23 +528,42 @@ source groups/global/supabase-helpers.sh
 sb_insert_item "test item" "note" "discord"
 # → returns a UUID
 
+sb_list_projects
+# → [] (empty array, no error)
+
 # 2. SQLite scheduled tasks registered
 sqlite3 store/messages.db \
   "SELECT schedule_type, schedule_value, status FROM scheduled_tasks"
 # → two rows: cron 0 8 * * *, cron 0 20 * * 0
 
-# 3. Services running (Linux)
+# 3. Services and timers running (Linux)
 systemctl --user status nanoclaw-voice-watcher
-systemctl --user list-timers | grep notion-sync
+systemctl --user list-timers | grep -E "notion-sync|elaborator|weekly-digest"
 
 # 4. Send a test Discord message
 # → agent replies with emoji-formatted capture summary within 5 seconds
 
 # 5. Check it's in Supabase
 sb_get_recent 1
-# → JSON array with your test item
+# → JSON array with your test item (elaboration will be null initially)
 
-# 6. Check it appears in Notion within 2 minutes
+# 6. Run elaborator manually — elaboration should appear within seconds
+npx tsx scripts/elaborator.ts
+sb_get_elaboration <item-uuid>
+# → AI elaboration text
+
+# 7. Check item appears in Notion flat DB within 2 minutes
+# → after notion-sync runs, check the flat database
+
+# 8. PARA hub: add NOTION_HUB_PAGE_ID to data/env/env, then:
+npx tsx scripts/notion-sync.ts
+# → logs/notion-hub-state.json should contain 7 Notion IDs
+# → hub page in Notion should have 6 sub-databases + Weekly Digests page
+
+# 9. Run weekly digest manually
+npx tsx scripts/weekly-digest.ts
+# → weekly_digests table has a new row
+# → after next notion-sync run, a digest page appears in Notion
 ```
 
 ## Second Brain Troubleshooting
@@ -446,5 +577,11 @@ sb_get_recent 1
 **Notion sync stuck**: Check `logs/notion-errors.log`. Most common cause: Notion integration not connected to the database (Notion page → ⋯ → Connect to).
 
 **Duplicate items from Notion inbound**: `NOTION_SETUP_AFTER` filters out old pages. If still duplicating, check `Supabase ID` property is being written back correctly after first sync.
+
+**Elaboration not appearing in Notion**: Check `logs/elaborator.log` for Claude API errors. Ensure `ANTHROPIC_API_KEY` is set in `data/env/env`. After elaboration appears in Supabase, the next `notion-sync.ts` run writes it to the hub page body — check `elaboration_synced_at` in Supabase is being updated.
+
+**Hub structure not creating**: `NOTION_HUB_PAGE_ID` must be set in `data/env/env`. Check `logs/notion-hub-state.json` — if it has all 7 IDs, the structure exists. Verify the Notion integration token has access to the hub page (open the page in Notion → ⋯ → Connect to → select your integration).
+
+**Weekly digest not appearing**: Run `npx tsx scripts/weekly-digest.ts` manually and check `logs/weekly-digest.log`. The digest is idempotent — if a row already exists for this `week_start`, it skips. Delete the row in Supabase to force regeneration. Notion page is created on the next `notion-sync.ts` run after digest insertion.
 
 **Scheduled jobs not firing**: `sqlite3 store/messages.db "SELECT id, status, next_run FROM scheduled_tasks"`. If `next_run` is in the past, the scheduler (60s poll) should pick them up. If status is not `active`, update it: `UPDATE scheduled_tasks SET status='active' WHERE ...`.

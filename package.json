@@ -16,12 +16,14 @@
     "setup": "tsx setup/index.ts",
     "auth": "tsx src/whatsapp-auth.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "dashboard": "tsx scripts/dashboard-server.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
-    "discord.js": "^14.18.0",
     "cron-parser": "^5.5.0",
+    "discord.js": "^14.18.0",
+    "express": "^5.2.1",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "yaml": "^2.8.2",
@@ -29,6 +31,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.0",
     "@vitest/coverage-v8": "^4.0.18",
     "husky": "^9.1.7",
